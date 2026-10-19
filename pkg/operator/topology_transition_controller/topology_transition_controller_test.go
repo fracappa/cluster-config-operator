@@ -74,9 +74,44 @@ func TestSync(t *testing.T) {
 		assert.True(t, v1helpers.IsOperatorConditionFalse(status.Conditions, upgradeableCondition))
 	})
 
+	t.Run("conflicting infrastructure target is rejected without mutating status", func(t *testing.T) {
+		// SNO with controlPlane=HighlyAvailable requested but an explicit
+		// infrastructure=SingleReplica target: SNOToHACompact matches via its
+		// wildcard infrastructure target, but its updater sets infrastructure
+		// to HighlyAvailable, which would leave the explicit request diverging
+		// from status in a state no descriptor matches.
+		infra := newTestInfra(configv1.HighlyAvailableTopologyMode, configv1.SingleReplicaTopologyMode, configv1.SingleReplicaTopologyMode, configv1.NonePlatformType)
+		infra.Spec.InfrastructureTopology = configv1.SingleReplicaTopologyMode
+		ctrl := newTestController(infra, nil, nil, noopTransitions())
+
+		assert.NoError(t, ctrl.sync(context.TODO(), newTestSyncContext()))
+
+		_, status, _, err := ctrl.operatorClient.GetOperatorState()
+		if !assert.NoError(t, err) {
+			return
+		}
+		cond := v1helpers.FindOperatorCondition(status.Conditions, transitionProgressingCondition)
+		if !assert.NotNil(t, cond) {
+			return
+		}
+		assert.Equal(t, operatorv1.ConditionFalse, cond.Status)
+		assert.Equal(t, "UnsupportedTransition", cond.Reason)
+		assert.Contains(t, cond.Message, "spec.infrastructureTopology=SingleReplica conflicts with the transition target HighlyAvailable")
+		assert.True(t, v1helpers.IsOperatorConditionFalse(status.Conditions, upgradeableCondition))
+
+		// The transition must not be applied: status still matches the SNO state.
+		updated, err := ctrl.infraClient.Get(context.TODO(), "cluster", metav1.GetOptions{})
+		if !assert.NoError(t, err) {
+			return
+		}
+		assert.Equal(t, configv1.SingleReplicaTopologyMode, updated.Status.ControlPlaneTopology)
+		assert.Equal(t, configv1.SingleReplicaTopologyMode, updated.Status.InfrastructureTopology)
+	})
+
 	t.Run("preflight validation failure sets conditions and blocks upgrades", func(t *testing.T) {
 		failingTransitions := []TransitionDescriptor{
 			{
+				Name: "SNOToHACompact",
 				From: configv1.InfrastructureStatus{
 					ControlPlaneTopology:   configv1.SingleReplicaTopologyMode,
 					InfrastructureTopology: configv1.SingleReplicaTopologyMode,
@@ -88,7 +123,10 @@ func TestSync(t *testing.T) {
 				PreflightValidators: []PreflightCheck{
 					{Type: "ControlPlaneNodeCountSatisfied", Validate: func() error { return fmt.Errorf("insufficient control plane nodes") }},
 				},
-				UpdateStatus: func(infra *configv1.Infrastructure) {},
+				UpdateStatus: func(infra *configv1.Infrastructure) {
+					infra.Status.ControlPlaneTopology = configv1.HighlyAvailableTopologyMode
+					infra.Status.InfrastructureTopology = configv1.HighlyAvailableTopologyMode
+				},
 			},
 		}
 
@@ -115,7 +153,7 @@ func TestSync(t *testing.T) {
 		now := time.Now()
 		infra := newTestInfra(configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, configv1.NonePlatformType)
 		clk := clocktesting.NewFakePassiveClock(now)
-		ctrl := newTestControllerWithClock(infra, transitionInProgressConditionsAt(now), nil, noopTransitions(), clk)
+		ctrl := newTestControllerWithClock(infra, transitionInProgressConditionsAt(now, "SNOToHACompact"), nil, noopTransitions(), clk)
 
 		if !assert.NoError(t, ctrl.sync(context.TODO(), newTestSyncContext())) {
 			return
@@ -131,7 +169,7 @@ func TestSync(t *testing.T) {
 
 	t.Run("reconciliation complete clears conditions", func(t *testing.T) {
 		infra := newTestInfra(configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, configv1.NonePlatformType)
-		ctrl := newTestController(infra, transitionInProgressConditions(), nil, noopTransitions())
+		ctrl := newTestController(infra, transitionInProgressConditions("SNOToHACompact"), nil, noopTransitions())
 
 		if !assert.NoError(t, ctrl.sync(context.TODO(), newTestSyncContext())) {
 			return
@@ -147,7 +185,7 @@ func TestSync(t *testing.T) {
 
 	t.Run("reconciliation not complete preserves conditions", func(t *testing.T) {
 		infra := newTestInfra(configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, configv1.NonePlatformType)
-		ctrl := newTestController(infra, transitionInProgressConditions(), nil, noopTransitionsWithValidators(
+		ctrl := newTestController(infra, transitionInProgressConditions("SNOToHACompact"), nil, noopTransitionsWithValidators(
 			func() error { return fmt.Errorf("not yet reconciled") },
 		))
 
@@ -163,13 +201,13 @@ func TestSync(t *testing.T) {
 		assert.True(t, v1helpers.IsOperatorConditionFalse(status.Conditions, upgradeableCondition))
 	})
 
-	t.Run("idle path with stale TopologyTransitionInProgress routes through reconciliation", func(t *testing.T) {
+	t.Run("idle path with stale transition routes through reconciliation", func(t *testing.T) {
 		infra := newTestInfra(configv1.SingleReplicaTopologyMode, configv1.SingleReplicaTopologyMode, configv1.SingleReplicaTopologyMode, configv1.NonePlatformType)
 		staleConditions := []operatorv1.OperatorCondition{
 			{
 				Type:   upgradeableCondition,
 				Status: operatorv1.ConditionFalse,
-				Reason: reasonTopologyTransitionInProgress,
+				Reason: "TestTransition",
 			},
 		}
 		ctrl := newTestController(infra, staleConditions, nil, reconciliationTestTransitions())
@@ -193,7 +231,7 @@ func TestSync(t *testing.T) {
 			{
 				Type:               upgradeableCondition,
 				Status:             operatorv1.ConditionFalse,
-				Reason:             reasonTopologyTransitionInProgress,
+				Reason:             "TestTransition",
 				LastTransitionTime: metav1.NewTime(now),
 			},
 		}
@@ -217,7 +255,7 @@ func TestSync(t *testing.T) {
 			{
 				Type:               upgradeableCondition,
 				Status:             operatorv1.ConditionFalse,
-				Reason:             reasonTopologyTransitionInProgress,
+				Reason:             "TestTransition",
 				LastTransitionTime: metav1.NewTime(now),
 			},
 		}
@@ -232,13 +270,13 @@ func TestSync(t *testing.T) {
 		assert.True(t, v1helpers.IsOperatorConditionTrue(status.Conditions, upgradeableCondition))
 	})
 
-	t.Run("idle path with stale TopologyTransitionInProgress blocks when reconciliation incomplete", func(t *testing.T) {
+	t.Run("idle path with stale transition blocks when reconciliation incomplete", func(t *testing.T) {
 		infra := newTestInfra(configv1.SingleReplicaTopologyMode, configv1.SingleReplicaTopologyMode, configv1.SingleReplicaTopologyMode, configv1.NonePlatformType)
 		staleConditions := []operatorv1.OperatorCondition{
 			{
 				Type:   upgradeableCondition,
 				Status: operatorv1.ConditionFalse,
-				Reason: reasonTopologyTransitionInProgress,
+				Reason: "TestTransition",
 			},
 		}
 		ctrl := newTestController(infra, staleConditions, nil, reconciliationTestTransitions(
@@ -348,7 +386,7 @@ func TestSync(t *testing.T) {
 		// Progressing=True but the infra status update never completed,
 		// so spec != status still holds.
 		infra := newTestInfra(configv1.HighlyAvailableTopologyMode, configv1.SingleReplicaTopologyMode, configv1.SingleReplicaTopologyMode, configv1.NonePlatformType)
-		ctrl := newTestController(infra, transitionInProgressConditions(), nil, noopTransitions())
+		ctrl := newTestController(infra, transitionInProgressConditions("SNOToHACompact"), nil, noopTransitions())
 
 		if !assert.NoError(t, ctrl.sync(context.TODO(), newTestSyncContext())) {
 			return
@@ -371,7 +409,7 @@ func TestSync(t *testing.T) {
 
 	t.Run("reconciliation blocked when one of several transition validators fails", func(t *testing.T) {
 		infra := newTestInfra(configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, configv1.NonePlatformType)
-		ctrl := newTestController(infra, transitionInProgressConditions(), nil, noopTransitionsWithValidators(
+		ctrl := newTestController(infra, transitionInProgressConditions("SNOToHACompact"), nil, noopTransitionsWithValidators(
 			func() error { return nil },
 			func() error { return fmt.Errorf("machine config pool not ready") },
 			func() error { return nil },
@@ -389,7 +427,7 @@ func TestSync(t *testing.T) {
 
 	t.Run("reconciliation completes when all transition validators pass", func(t *testing.T) {
 		infra := newTestInfra(configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, configv1.NonePlatformType)
-		ctrl := newTestController(infra, transitionInProgressConditions(), nil, noopTransitionsWithValidators(
+		ctrl := newTestController(infra, transitionInProgressConditions("SNOToHACompact"), nil, noopTransitionsWithValidators(
 			func() error { return nil },
 			func() error { return nil },
 		))
@@ -404,11 +442,139 @@ func TestSync(t *testing.T) {
 		assert.True(t, v1helpers.IsOperatorConditionTrue(status.Conditions, upgradeableCondition))
 	})
 
-	t.Run("reconciliation with no matching transition treats validators as satisfied", func(t *testing.T) {
+	t.Run("infrastructure transition triggered sets conditions and updates status", func(t *testing.T) {
+		infra := newTestInfraWithInfraSpec(configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, configv1.SingleReplicaTopologyMode, configv1.NonePlatformType)
+		ctrl := newTestController(infra, nil, nil, noopInfraTransitions())
+
+		if !assert.NoError(t, ctrl.sync(context.TODO(), newTestSyncContext())) {
+			return
+		}
+
+		_, status, _, err := ctrl.operatorClient.GetOperatorState()
+		if !assert.NoError(t, err) {
+			return
+		}
+		assert.True(t, v1helpers.IsOperatorConditionTrue(status.Conditions, transitionProgressingCondition))
+		assert.True(t, v1helpers.IsOperatorConditionFalse(status.Conditions, upgradeableCondition))
+
+		updated, err := ctrl.infraClient.Get(context.TODO(), "cluster", metav1.GetOptions{})
+		if !assert.NoError(t, err) {
+			return
+		}
+		assert.Equal(t, configv1.HighlyAvailableTopologyMode, updated.Status.InfrastructureTopology)
+		assert.Equal(t, configv1.HighlyAvailableTopologyMode, updated.Status.ControlPlaneTopology)
+	})
+
+	t.Run("infrastructure transition idle when spec matches status", func(t *testing.T) {
+		infra := newTestInfraWithInfraSpec(configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, configv1.NonePlatformType)
+		ctrl := newTestController(infra, nil, nil, noopInfraTransitions())
+
+		assert.NoError(t, ctrl.sync(context.TODO(), newTestSyncContext()))
+	})
+
+	t.Run("infrastructure transition reconciliation complete clears conditions", func(t *testing.T) {
+		infra := newTestInfraWithInfraSpec(configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, configv1.NonePlatformType)
+		ctrl := newTestController(infra, transitionInProgressConditions("InfrastructureSingleToHA"), nil, noopInfraTransitions())
+
+		if !assert.NoError(t, ctrl.sync(context.TODO(), newTestSyncContext())) {
+			return
+		}
+
+		_, status, _, err := ctrl.operatorClient.GetOperatorState()
+		if !assert.NoError(t, err) {
+			return
+		}
+		assert.True(t, v1helpers.IsOperatorConditionFalse(status.Conditions, transitionProgressingCondition))
+		assert.True(t, v1helpers.IsOperatorConditionTrue(status.Conditions, upgradeableCondition))
+	})
+
+	t.Run("infrastructure transition reconciliation blocked when validators fail", func(t *testing.T) {
+		infra := newTestInfraWithInfraSpec(configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, configv1.NonePlatformType)
+		ctrl := newTestController(infra, transitionInProgressConditions("InfrastructureSingleToHA"), nil, noopInfraTransitionsWithValidators(
+			func() error { return fmt.Errorf("ingress not scaled up") },
+		))
+
+		if !assert.NoError(t, ctrl.sync(context.TODO(), newTestSyncContext())) {
+			return
+		}
+
+		_, status, _, err := ctrl.operatorClient.GetOperatorState()
+		if !assert.NoError(t, err) {
+			return
+		}
+		assert.True(t, v1helpers.IsOperatorConditionTrue(status.Conditions, transitionProgressingCondition))
+		assert.True(t, v1helpers.IsOperatorConditionFalse(status.Conditions, upgradeableCondition))
+	})
+
+	t.Run("reconciliation uses correct validators when both transitions are registered", func(t *testing.T) {
+		// Both SNO->HA and infra SR->HA transitions share target HA topology.
+		// After the infra SR->HA transition is applied, spec is {CP:HA, Infra:HA}.
+		// Without the transition name in the condition, matchesSpec picks
+		// the SNO->HA descriptor first (wrong validators). The condition's
+		// Reason must route to the correct descriptor.
+		snoValidatorCalled := false
+		infraValidatorCalled := false
+		bothTransitions := []TransitionDescriptor{
+			{
+				Name: "SNOToHACompact",
+				From: configv1.InfrastructureStatus{
+					ControlPlaneTopology:   configv1.SingleReplicaTopologyMode,
+					InfrastructureTopology: configv1.SingleReplicaTopologyMode,
+					PlatformStatus:         &configv1.PlatformStatus{Type: configv1.NonePlatformType},
+				},
+				To: configv1.InfrastructureSpec{
+					ControlPlaneTopology: configv1.HighlyAvailableTopologyMode,
+				},
+				UpdateStatus: func(infra *configv1.Infrastructure) {
+					infra.Status.ControlPlaneTopology = configv1.HighlyAvailableTopologyMode
+					infra.Status.InfrastructureTopology = configv1.HighlyAvailableTopologyMode
+				},
+				TransitionValidators: []TransitionValidatorFunc{
+					func() error { snoValidatorCalled = true; return nil },
+				},
+			},
+			{
+				Name: "InfrastructureSingleToHA",
+				From: configv1.InfrastructureStatus{
+					ControlPlaneTopology:   configv1.HighlyAvailableTopologyMode,
+					InfrastructureTopology: configv1.SingleReplicaTopologyMode,
+				},
+				To: configv1.InfrastructureSpec{
+					InfrastructureTopology: configv1.HighlyAvailableTopologyMode,
+				},
+				UpdateStatus: func(infra *configv1.Infrastructure) {
+					infra.Status.InfrastructureTopology = configv1.HighlyAvailableTopologyMode
+				},
+				TransitionValidators: []TransitionValidatorFunc{
+					func() error { infraValidatorCalled = true; return nil },
+				},
+			},
+		}
+
+		infra := newTestInfraWithInfraSpec(configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, configv1.NonePlatformType)
+		infra.Spec.ControlPlaneTopology = configv1.HighlyAvailableTopologyMode
+		ctrl := newTestController(infra, transitionInProgressConditions("InfrastructureSingleToHA"), nil, bothTransitions)
+
+		if !assert.NoError(t, ctrl.sync(context.TODO(), newTestSyncContext())) {
+			return
+		}
+
+		assert.False(t, snoValidatorCalled, "SNO->HA validators should not run during infra transition")
+		assert.True(t, infraValidatorCalled, "infra SR->HA validators should run")
+
+		_, status, _, err := ctrl.operatorClient.GetOperatorState()
+		if !assert.NoError(t, err) {
+			return
+		}
+		assert.True(t, v1helpers.IsOperatorConditionFalse(status.Conditions, transitionProgressingCondition))
+		assert.True(t, v1helpers.IsOperatorConditionTrue(status.Conditions, upgradeableCondition))
+	})
+
+	t.Run("reconciliation with unknown transition name treats validators as satisfied", func(t *testing.T) {
 		infra := newTestInfra(configv1.SingleReplicaTopologyMode, configv1.SingleReplicaTopologyMode, configv1.SingleReplicaTopologyMode, configv1.NonePlatformType)
-		// noopTransitions only matches a HighlyAvailable spec, so it won't
-		// match this SingleReplica infra — there are no validators to run.
-		ctrl := newTestController(infra, transitionInProgressConditions(), nil, noopTransitions())
+		// Progressing condition names a transition that doesn't match any
+		// registered descriptor — there are no validators to run.
+		ctrl := newTestController(infra, transitionInProgressConditions("UnknownTransition"), nil, noopTransitions())
 
 		assert.NoError(t, ctrl.sync(context.TODO(), newTestSyncContext()))
 
@@ -517,11 +683,86 @@ func TestMatchesSpec(t *testing.T) {
 			},
 			expected: false,
 		},
+		{
+			name: "infrastructure topology exact match",
+			descriptor: configv1.InfrastructureSpec{
+				InfrastructureTopology: configv1.HighlyAvailableTopologyMode,
+			},
+			actual: configv1.InfrastructureSpec{
+				InfrastructureTopology: configv1.HighlyAvailableTopologyMode,
+			},
+			expected: true,
+		},
+		{
+			name: "infrastructure topology mismatch",
+			descriptor: configv1.InfrastructureSpec{
+				InfrastructureTopology: configv1.HighlyAvailableTopologyMode,
+			},
+			actual: configv1.InfrastructureSpec{
+				InfrastructureTopology: configv1.SingleReplicaTopologyMode,
+			},
+			expected: false,
+		},
+		{
+			name: "infrastructure topology wildcard matches any",
+			descriptor: configv1.InfrastructureSpec{
+				ControlPlaneTopology: configv1.HighlyAvailableTopologyMode,
+			},
+			actual: configv1.InfrastructureSpec{
+				ControlPlaneTopology:   configv1.HighlyAvailableTopologyMode,
+				InfrastructureTopology: configv1.SingleReplicaTopologyMode,
+			},
+			expected: true,
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			assert.Equal(t, tc.expected, matchesSpec(tc.descriptor, tc.actual))
+		})
+	}
+}
+
+func TestHasTopologyDivergence(t *testing.T) {
+	tests := []struct {
+		name     string
+		infra    *configv1.Infrastructure
+		expected bool
+	}{
+		{
+			name:     "no divergence when spec empty",
+			infra:    newTestInfra("", configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, ""),
+			expected: false,
+		},
+		{
+			name:     "no divergence when spec matches status",
+			infra:    newTestInfra(configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, ""),
+			expected: false,
+		},
+		{
+			name:     "control plane divergence",
+			infra:    newTestInfra(configv1.HighlyAvailableTopologyMode, configv1.SingleReplicaTopologyMode, configv1.SingleReplicaTopologyMode, ""),
+			expected: true,
+		},
+		{
+			name:     "infrastructure divergence",
+			infra:    newTestInfraWithInfraSpec(configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, configv1.SingleReplicaTopologyMode, configv1.NonePlatformType),
+			expected: true,
+		},
+		{
+			name: "infrastructure divergence with matching control plane",
+			infra: func() *configv1.Infrastructure {
+				infra := newTestInfraWithInfraSpec(configv1.HighlyAvailableTopologyMode, configv1.HighlyAvailableTopologyMode, configv1.SingleReplicaTopologyMode, configv1.NonePlatformType)
+				infra.Spec.ControlPlaneTopology = configv1.HighlyAvailableTopologyMode
+				return infra
+			}(),
+			expected: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.expected, hasTopologyDivergence(tc.infra))
 		})
 	}
 }
